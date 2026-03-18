@@ -43,6 +43,11 @@ public partial class MainWindow : Window
         RegexOptions.Compiled
     );
 
+    private static readonly Regex FinalSkippedRegex = new(
+        @"final_int8_zlib_roundtrip skipped by FINAL_ROUNDTRIP_EVAL=0",
+        RegexOptions.Compiled
+    );
+
     private static readonly Regex StopEarlyRegex = new(
         @"stopping_early:\s+wallclock_cap",
         RegexOptions.Compiled
@@ -196,6 +201,7 @@ public partial class MainWindow : Window
         var hasMeasuredStep = false;
         var stopEarlySeen = false;
         var quantArtifactReady = false;
+        var finalRoundtripSkipped = false;
         var maxWallclockSeconds = 0.0;
         DateTime? runStartTime = null;
 
@@ -265,6 +271,13 @@ public partial class MainWindow : Window
                 hasMeasuredStep = true;
             }
 
+            if (FinalSkippedRegex.IsMatch(line))
+            {
+                finalRoundtripSkipped = true;
+                lastStepKind = "Finished";
+                lastParsedLine = line;
+            }
+
             if (StopEarlyRegex.IsMatch(line))
             {
                 stopEarlySeen = true;
@@ -313,8 +326,10 @@ public partial class MainWindow : Window
             double.TryParse(latestTrainTime, NumberStyles.Float, CultureInfo.InvariantCulture, out var latestTrainTimeMsSnapshot) &&
             latestTrainTimeMsSnapshot >= maxWallclockSeconds * 1000.0 &&
             finalValBpb.Length == 0;
+        var proxyComplete = finalRoundtripSkipped;
         var progressPercent = CalculateProgressPercent(
             finalValBpb,
+            proxyComplete,
             waitingOnInitialValidation,
             capExceededWithoutFinal,
             stopEarlySeen,
@@ -331,7 +346,11 @@ public partial class MainWindow : Window
             fileInfo.LastWriteTime,
             logAge
         );
-        if (waitingOnInitialValidation)
+        if (proxyComplete)
+        {
+            lastStepKind = "Finished";
+        }
+        else if (waitingOnInitialValidation)
         {
             lastStepKind = "Initial validation";
         }
@@ -352,6 +371,10 @@ public partial class MainWindow : Window
         if (finalValBpb.Length > 0)
         {
             progressLabel = "Finished";
+        }
+        else if (proxyComplete)
+        {
+            progressLabel = $"Finished at step {currentStep} | final roundtrip eval skipped";
         }
         else if (waitingOnInitialValidation)
         {
@@ -388,6 +411,25 @@ public partial class MainWindow : Window
         if (finalValBpb.Length > 0)
         {
             metrics = $"final val_loss {finalValLoss} | final val_bpb {finalValBpb}";
+        }
+        else if (proxyComplete)
+        {
+            var proxyMetricParts = new List<string>();
+            if (latestValLoss.Length > 0)
+            {
+                proxyMetricParts.Add($"proxy val_loss {latestValLoss}");
+            }
+            if (latestValBpb.Length > 0)
+            {
+                proxyMetricParts.Add($"proxy val_bpb {latestValBpb}");
+            }
+            if (artifactBytes.Length > 0)
+            {
+                proxyMetricParts.Add($"artifact_bytes {artifactBytes}");
+            }
+            metrics = proxyMetricParts.Count > 0
+                ? string.Join(" | ", proxyMetricParts)
+                : "Proxy run complete; int8 artifact exported and final roundtrip eval skipped";
         }
         else if (waitingOnInitialValidation)
         {
@@ -451,11 +493,15 @@ public partial class MainWindow : Window
         {
             timingParts.Add("training stopped at wallclock cap");
         }
-        if (quantArtifactReady)
+        if (quantArtifactReady && !proxyComplete)
         {
             timingParts.Add("post-quant validation in progress");
         }
-        if (capExceededWithoutFinal)
+        if (proxyComplete)
+        {
+            timingParts.Add("proxy run complete");
+        }
+        if (capExceededWithoutFinal && !proxyComplete)
         {
             timingParts.Add("training cap hit; final eval in progress");
         }
@@ -466,6 +512,7 @@ public partial class MainWindow : Window
 
         var etaLine = BuildEtaLine(
             finalValBpb,
+            proxyComplete,
             waitingOnInitialValidation,
             capExceededWithoutFinal,
             stopEarlySeen,
@@ -484,6 +531,7 @@ public partial class MainWindow : Window
         );
         var currentPhaseIndex = DetermineCurrentPhaseIndex(
             finalValBpb,
+            proxyComplete,
             waitingOnInitialValidation,
             capExceededWithoutFinal,
             stopEarlySeen,
@@ -565,6 +613,7 @@ public partial class MainWindow : Window
 
     private static string BuildEtaLine(
         string finalValBpb,
+        bool proxyComplete,
         bool waitingOnInitialValidation,
         bool capExceededWithoutFinal,
         bool stopEarlySeen,
@@ -586,6 +635,11 @@ public partial class MainWindow : Window
             return "Complete";
         }
 
+        if (proxyComplete)
+        {
+            return "Complete (roundtrip skipped)";
+        }
+
         if (capExceededWithoutFinal)
         {
             var remainingWrapUp = EstimateWrapUpRemaining(
@@ -601,13 +655,17 @@ public partial class MainWindow : Window
             );
             if (remainingWrapUp.HasValue)
             {
-                var finishTime = DateTime.Now + remainingWrapUp.Value;
                 var stageLabel = quantArtifactReady
                     ? "quant eval"
                     : stopEarlySeen
                         ? "packaging + quant eval"
                         : "final + quant eval";
-                return $"{FormatClockTime(finishTime)} (~{FormatDuration(remainingWrapUp.Value)} left, {stageLabel})";
+                if (remainingWrapUp.Value > TimeSpan.Zero)
+                {
+                    var finishTime = DateTime.Now + remainingWrapUp.Value;
+                    return $"{FormatClockTime(finishTime)} (~{FormatDuration(remainingWrapUp.Value)} left, {stageLabel})";
+                }
+                return $"Over expected time by {FormatDuration(remainingWrapUp.Value.Duration())} ({stageLabel})";
             }
             return "Wrapping up final eval";
         }
@@ -734,7 +792,7 @@ public partial class MainWindow : Window
         }
 
         var remaining = stageEstimate - logAge;
-        return remaining > TimeSpan.Zero ? remaining : TimeSpan.FromSeconds(15);
+        return remaining;
     }
 
     private static TimeSpan? EstimateValidationPassDuration(
@@ -783,6 +841,7 @@ public partial class MainWindow : Window
 
     private static double CalculateProgressPercent(
         string finalValBpb,
+        bool proxyComplete,
         bool waitingOnInitialValidation,
         bool capExceededWithoutFinal,
         bool stopEarlySeen,
@@ -806,7 +865,7 @@ public partial class MainWindow : Window
         const double trainingSpan = finalValidationStart - trainingStart;
         const double wrapUpSpan = 4.0;
 
-        if (finalValBpb.Length > 0)
+        if (finalValBpb.Length > 0 || proxyComplete)
         {
             return 100.0;
         }
@@ -915,6 +974,7 @@ public partial class MainWindow : Window
 
     private static int DetermineCurrentPhaseIndex(
         string finalValBpb,
+        bool proxyComplete,
         bool waitingOnInitialValidation,
         bool capExceededWithoutFinal,
         bool stopEarlySeen,
@@ -924,7 +984,7 @@ public partial class MainWindow : Window
         int currentStep,
         bool hasMeasuredStep)
     {
-        if (finalValBpb.Length > 0)
+        if (finalValBpb.Length > 0 || proxyComplete)
         {
             return DonePhase;
         }
