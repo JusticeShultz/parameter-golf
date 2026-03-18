@@ -1,0 +1,4 @@
+Baseline after initial easy wins:
+val_loss: 3.4190
+val_bpb: 2.0916
+artifact_bytes: 6831983
