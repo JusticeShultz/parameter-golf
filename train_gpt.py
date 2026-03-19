@@ -99,6 +99,9 @@ class Hyperparameters:
     compression_reg_warmup_steps = int(os.environ.get("COMPRESSION_REG_WARMUP_STEPS", "0"))
     compression_reg_sample_tensors = int(os.environ.get("COMPRESSION_REG_SAMPLE_TENSORS", "4"))
     compression_reg_max_cols = int(os.environ.get("COMPRESSION_REG_MAX_COLS", "256"))
+    compression_grid_reg_weight = float(os.environ.get("COMPRESSION_GRID_REG_WEIGHT", "0.0"))
+    compression_rank1_reg_weight = float(os.environ.get("COMPRESSION_RANK1_REG_WEIGHT", "0.0"))
+    compression_scale_reg_weight = float(os.environ.get("COMPRESSION_SCALE_REG_WEIGHT", "0.0"))
     ternary_reg_weight = float(os.environ.get("TERNARY_REG_WEIGHT", "0.0"))
     outlier_reg_weight = float(os.environ.get("OUTLIER_REG_WEIGHT", "0.0"))
     eval_cache_mix_weight = float(os.environ.get("EVAL_CACHE_MIX_WEIGHT", "0.0"))
@@ -126,8 +129,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
-
-
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
@@ -185,8 +186,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-
-
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
@@ -221,8 +220,6 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
-
-
 def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -237,8 +234,6 @@ def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> T
             f"Validation split is too short for TRAIN_SEQ_LEN={seq_len} and VAL_MAX_TOKENS={max_tokens}"
         )
     return tokens[: usable + 1]
-
-
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -637,6 +632,36 @@ def compression_regularizer(
             axis = 0 if meta is None else int(meta["axis"])
             recon = dequantize_int8_tensor(q, s, dtype=torch.float32, axis=axis)
         reg = F.mse_loss(view, recon, reduction="mean")
+        if args.compression_grid_reg_weight > 0.0:
+            if s.ndim == 0:
+                scale_view = s.to(dtype=torch.float32).view(*([1] * view.ndim))
+            elif axis == 0:
+                scale_view = s.to(dtype=torch.float32).view(view.shape[0], *([1] * (view.ndim - 1)))
+            else:
+                scale_view = s.to(dtype=torch.float32).view(*([1] * (view.ndim - 1)), view.shape[-1])
+            normalized = (view / scale_view).clamp(-127.0, 127.0)
+            grid_target = normalized.detach().round().clamp_(-127.0, 127.0)
+            reg = reg + args.compression_grid_reg_weight * F.mse_loss(normalized, grid_target, reduction="mean")
+        if args.compression_scale_reg_weight > 0.0 and view.ndim == 2:
+            channel_rms = view.square().mean(dim=1 if axis == 0 else 0).sqrt().clamp_min(1e-6)
+            if channel_rms.numel() > 1:
+                log_scale = channel_rms.log()
+                reg = reg + args.compression_scale_reg_weight * F.mse_loss(
+                    log_scale[1:], log_scale[:-1], reduction="mean"
+                )
+        if (
+            args.compression_rank1_reg_weight > 0.0
+            and view.ndim == 2
+            and INT8_RESIDUAL_RANK == 1
+            and INT8_RESIDUAL_BUDGET_BYTES > 0
+        ):
+            with torch.no_grad():
+                left, right, benefit = approximate_rank1_residual(view.detach().float() - recon.float(), INT8_RESIDUAL_POWER_ITERS)
+                if left.numel() > 0 and right.numel() > 0 and benefit > 0.0:
+                    recon_rank1 = recon + left.float().unsqueeze(1) * right.float().unsqueeze(0)
+                else:
+                    recon_rank1 = recon
+            reg = reg + args.compression_rank1_reg_weight * F.mse_loss(view, recon_rank1, reduction="mean")
         if args.ternary_reg_weight > 0.0:
             scale = view.abs().mean().clamp_min(1e-6)
             ternary = scale * view.div(scale).round().clamp_(-1.0, 1.0)
@@ -834,8 +859,6 @@ class CausalSelfAttention(nn.Module):
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
-
-
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
@@ -848,8 +871,6 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
-
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -871,8 +892,6 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x), q_gain)
         mlp_out = self.mlp(self.mlp_norm(x))
         return attn_out, mlp_out
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -1216,7 +1235,9 @@ def main() -> None:
     log0(
         f"compression_reg:weight:{args.compression_reg_weight} interval:{args.compression_reg_interval} "
         f"warmup_steps:{args.compression_reg_warmup_steps} sample_tensors:{args.compression_reg_sample_tensors} "
-        f"max_cols:{args.compression_reg_max_cols} ternary:{args.ternary_reg_weight} "
+        f"max_cols:{args.compression_reg_max_cols} grid:{args.compression_grid_reg_weight} "
+        f"scale:{args.compression_scale_reg_weight} rank1:{args.compression_rank1_reg_weight} "
+        f"ternary:{args.ternary_reg_weight} "
         f"outlier:{args.outlier_reg_weight} candidates:{len(compression_reg_tensors)}"
     )
     log0(

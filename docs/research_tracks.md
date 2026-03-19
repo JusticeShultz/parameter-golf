@@ -31,6 +31,9 @@ Priority order is dictated by the challenge rules:
 - `WINDOW_SIZE`
 - `EMBED_DIM`
 - `COMPRESSION_REG_WEIGHT`
+- `COMPRESSION_GRID_REG_WEIGHT`
+- `COMPRESSION_SCALE_REG_WEIGHT`
+- `COMPRESSION_RANK1_REG_WEIGHT`
 - `TERNARY_REG_WEIGHT`
 - `OUTLIER_REG_WEIGHT`
 - `EVAL_CACHE_MIX_WEIGHT`
@@ -144,36 +147,144 @@ Use this when ranking experiments on a more faithful local objective:
     - the sidecar branch is the closest secondary idea so far
     - it still did not beat the plain dense compression-aware winner
     - keep it parked as a late-stage add-on, not the current pivot
+- Conservative ternary / low-bit sweep on top of the winning dense compression setup:
+  - sweep: `ternaryrtsweep_20260318_201412`
+  - tested:
+    - `TERNARY_REG_WEIGHT=0.0005` -> `2.07311732`
+    - `TERNARY_REG_WEIGHT=0.0010` -> `2.07009530`
+    - `TERNARY_REG_WEIGHT=0.0020` -> `2.07025558`
+    - `TERNARY_REG_WEIGHT=0.0035` -> `2.08786263`
+    - `TERNARY_REG_WEIGHT=0.0050` -> `2.07821685`
+  - interpretation:
+    - native low-bit pressure in this form clearly hurts the local roundtrip metric
+    - very small ternary weights degrade less, but still do not approach the current leader
+    - do not prioritize ternary shaping again until a stronger baseline exists or the training formulation changes
+- Quantization residual-budget sweep on top of the winning dense compression setup:
+  - sweep: `residualrtsweep_20260318_203241`
+  - tested:
+    - `residual_rank=0, residual_budget=0` -> baseline export control for this sweep
+    - `residual_rank=1, residual_budget=65536` -> `2.08312093`
+    - `residual_rank=1, residual_budget=262144` -> `2.08187280`
+    - `residual_rank=1, residual_budget=524288` -> `2.08285302`
+    - `residual_rank=1, residual_budget=1048576` -> `2.07731235`
+  - interpretation:
+    - spending more bytes on rank-1 residual export corrections did not improve the local roundtrip metric
+    - the export-side residual mechanism is not currently a better lever than the plain dense compression-aware setup
+    - quantization-budget tuning should be deprioritized for now
+- Refined sidecar micro-sweep around the prior near-win:
+  - sweep: `sidecarrefine_20260318_205219`
+  - completed exact results:
+    - `cache=0.018, bigram=0.030, size=8` -> `2.08080110`
+    - `cache=0.020, bigram=0.028, size=8` -> `2.07489103`
+    - `cache=0.020, bigram=0.030, size=8` rerun -> `2.08947255`
+    - `cache=0.020, bigram=0.032, size=8` -> `2.07840275`
+  - incomplete run:
+    - `cache=0.022, bigram=0.030, size=8` reached artifact export but did not write `final_int8_zlib_roundtrip_exact`
+  - interpretation:
+    - the earlier `2.06132482` sidecar near-win did not reproduce
+    - the sidecar branch now looks unstable on the local roundtrip track
+    - measuring repeatability is more important than additional sidecar micro-tuning right now
+- Corrected wallclock repeatability sweep:
+  - sweep: `repeatrtsweepfix_20260318_215301`
+  - dense compression-aware runs:
+    - `base_a` -> `2.06761597`
+    - `base_b` -> `2.07369637`
+    - `base_c` -> `2.08956232`
+  - sidecar near-win reruns:
+    - `side_a` -> `2.05608381`
+    - `side_b` -> `2.09377262`
+    - `side_c` -> `2.07285932`
+  - interpretation:
+    - both branches show too much spread on the local `180s` wallclock track
+    - the best sidecar rerun did beat the standing leader, but the worst sidecar rerun was much worse
+    - the dominant local noise source now looks methodological, not architectural
+    - the next step should be a fixed-step local roundtrip track, not more wallclock micro-sweeps
+- Fixed-step roundtrip sweep:
+  - sweep: `fixedsteprtsweep_20260318_221632`
+  - dense compression-aware runs:
+    - `base_a` -> `2.04299145`
+    - `base_b` -> `2.04299145`
+  - sidecar near-win reruns:
+    - `side_a` -> `2.04300345`
+    - `side_b` -> `2.04300345`
+  - interpretation:
+    - once wallclock variance is removed, the sidecar branch is effectively identical to the dense baseline
+    - the dense compression-aware branch remains the cleanest local control
+    - future local search should use fixed-step comparison first, then wallclock only as a secondary sanity check
+- Export-aware fixed-step compression probe:
+  - sweep: `exportaware_fixedstep_20260318_223456`
+  - completed result:
+    - `g010_r000` -> `2.04288777`
+    - knobs: `COMPRESSION_REG_WEIGHT=0.005`, `COMPRESSION_GRID_REG_WEIGHT=0.10`, `COMPRESSION_RANK1_REG_WEIGHT=0.0`
+    - total artifact: `6,663,470` bytes
+    - delta vs fixed-step dense control: `-0.00010368 bpb` better
+  - execution note:
+    - the broader coarse sweep was aborted after the first positive signal to avoid spending more 3090 time on low-probability points
+  - interpretation:
+    - export-aware grid alignment is the first post-fixed-step change that improved the dense compression-aware control
+    - the gain is small, but it is deterministic and points in the right direction
+    - the next compression-native pivot should stay inside export-aware regularization, not revisit sidecar or architectural branches
+- Scale-aware fixed-step compression sweep:
+  - sweep: `scaleaware_fixedstep_20260318_224233`
+  - completed results:
+    - `g010_s0010` -> `2.04313626`
+    - `g010_s0025` -> `2.04358127`
+  - interpretation:
+    - adding explicit adjacent-scale smoothing made the roundtripped result slightly worse at both tested weights
+    - this version of scale-aware pressure does not improve on the grid-aligned winner
+    - the next best move is to refine the grid-alignment weight itself, not add more compression-native terms yet
+- Grid-refinement fixed-step sweep:
+  - sweep: `gridrefine_fixedstep_20260318_225110`
+  - completed results:
+    - `g0080` -> `2.04396986`
+    - `g0120` -> `2.04350611`
+  - interpretation:
+    - both nearby grid weights regressed versus the `0.10` winner
+    - `COMPRESSION_GRID_REG_WEIGHT=0.10` currently looks like a real local optimum on the fixed-step track
+    - the next compression-aware pivot should keep `grid=0.10` fixed and test only very small outlier pressure around it
 
 ## Current leader
 
-- `compressrt3090_20260318_175828`
+- `exportaware_fixedstep_20260318_223456_g010_r000`
 - dense attention, no sidecar, no recurrence, no factorized embedding
 - `COMPRESSION_REG_WEIGHT=0.005`
-- exact final roundtrip result: `val_bpb=2.06085837`
-- total artifact: `6,839,798` bytes
+- `COMPRESSION_GRID_REG_WEIGHT=0.10`
+- fixed-step exact final roundtrip result: `val_bpb=2.04288777`
+- total artifact: `6,663,470` bytes
+- best wallclock-track reference remains `compressrt3090_20260318_175828` at `2.06085837`
 
 ## Immediate next step
 
-- Pivot into native low-bit shaping on the roundtrip track
-- keep the dense compression-aware baseline fixed
-- add only very small `TERNARY_REG_WEIGHT` values first
-- keep `OUTLIER_REG_WEIGHT=0` until ternary-only behavior is measured cleanly
+- Attack compression-aware training more directly
+- keep the now-stable dense fixed-step baseline as the control
+- keep the export-aware grid term at `0.10`
+- test only tiny outlier pressure around the current winner
+- rank new compression-native ideas on the fixed-step roundtrip track first
 - rank experiments by `final_int8_zlib_roundtrip_exact val_bpb`
 
 ## Next experiments
 
-- Native low-bit / ternary shaping:
-  - sweep conservative `TERNARY_REG_WEIGHT` values on top of the winning dense compression-aware setup
-  - keep architecture and eval settings fixed
-  - decide first whether ternary pressure helps the actual roundtripped metric at all
-- Compression + ternary interaction:
-  - if a ternary value helps, retune `COMPRESSION_REG_WEIGHT` around that point
-  - only then reconsider tiny outlier suppression
-- Sidecar follow-up, only if low-bit shaping stalls:
-  - rerun the closest sidecar point on a clean single-run path
-  - only continue if it can beat the dense no-sidecar baseline
-  - otherwise keep the sidecar idea as a later ensemble/mixer branch
+- Export-aware compression regularizer:
+  - continue aligning sampled training-time regularization with the actual export path
+  - hold `COMPRESSION_GRID_REG_WEIGHT=0.10` fixed unless new evidence suggests otherwise
+- Tiny outlier suppression on top of grid alignment:
+  - revisit outlier pressure in the much smaller `1e-4` regime
+  - use the fixed-step track so tiny deltas are actually trustworthy
+- Scale-aware compression regularizer:
+  - parked for now after the first two weights regressed
+  - revisit only if a different formulation of scale entropy or scale clustering becomes compelling
+- Fixed-step compression sweeps:
+  - keep using the fixed-step roundtrip track as the local ranking metric
+  - only move promising compression-native changes back onto the 180s wallclock track later
+- Sidecar branch is parked:
+  - fixed-step results say it is not moving the needle in a reliable way
+  - do not spend more 3090 time on sidecar micro-tuning for now
+- Export-side ideas remain parked:
+  - residual-budget tuning did not help
+  - sparse attention did not help
+  - shared-block recurrence did not help
+- Low-bit shaping remains parked:
+  - revisit only if the training objective changes materially or H100 results suggest a different regime
 
 ## Medium-term work
 
