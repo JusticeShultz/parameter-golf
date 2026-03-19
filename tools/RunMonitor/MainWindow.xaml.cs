@@ -340,6 +340,20 @@ public partial class MainWindow : Window
             latestTrainTimeMsSnapshot >= maxWallclockSeconds * 1000.0 &&
             finalValBpb.Length == 0;
         var proxyComplete = finalRoundtripSkipped;
+        var staleWrapUp = IsLikelyStaleWrapUp(
+            finalValBpb,
+            proxyComplete,
+            capExceededWithoutFinal,
+            stopEarlySeen,
+            quantArtifactReady,
+            warmupDone,
+            warmupSteps,
+            latestStepAvg,
+            latestTrainTime,
+            runStartTime ?? fileInfo.CreationTime,
+            fileInfo.LastWriteTime,
+            logAge
+        );
         var progressPercent = CalculateProgressPercent(
             finalValBpb,
             proxyComplete,
@@ -367,6 +381,14 @@ public partial class MainWindow : Window
         {
             lastStepKind = "Initial validation";
         }
+        else if (staleWrapUp)
+        {
+            lastStepKind = quantArtifactReady
+                ? "Stale after quantized validation"
+                : stopEarlySeen
+                    ? "Stale during packaging"
+                    : "Stale during final validation";
+        }
         else if (quantArtifactReady)
         {
             lastStepKind = "Quantized validation";
@@ -392,6 +414,14 @@ public partial class MainWindow : Window
         else if (waitingOnInitialValidation)
         {
             progressLabel = $"Warmup {warmupDone}/{Math.Max(warmupSteps, warmupDone)} | waiting on step 0 validation";
+        }
+        else if (staleWrapUp)
+        {
+            progressLabel = quantArtifactReady
+                ? $"Cap reached at step {currentStep} | log went stale after quantized artifact export"
+                : stopEarlySeen
+                    ? $"Cap reached at step {currentStep} | log went stale during packaging"
+                    : $"Cap reached at step {currentStep} | log went stale during final validation";
         }
         else if (quantArtifactReady)
         {
@@ -447,6 +477,24 @@ public partial class MainWindow : Window
         else if (waitingOnInitialValidation)
         {
             metrics = "Waiting for the first full validation pass after warmup";
+        }
+        else if (staleWrapUp)
+        {
+            var staleMetricParts = new List<string>();
+            if (latestValLoss.Length > 0)
+            {
+                staleMetricParts.Add($"last proxy val_loss {latestValLoss}");
+            }
+            if (latestValBpb.Length > 0)
+            {
+                staleMetricParts.Add($"last proxy val_bpb {latestValBpb}");
+            }
+            if (artifactBytes.Length > 0)
+            {
+                staleMetricParts.Add($"artifact_bytes {artifactBytes}");
+            }
+            staleMetricParts.Add("no final roundtrip result recorded in this log");
+            metrics = string.Join(" | ", staleMetricParts);
         }
         else if (quantArtifactReady)
         {
@@ -506,7 +554,11 @@ public partial class MainWindow : Window
         {
             timingParts.Add("training stopped at wallclock cap");
         }
-        if (quantArtifactReady && !proxyComplete)
+        if (staleWrapUp)
+        {
+            timingParts.Add("log appears stale or incomplete");
+        }
+        if (quantArtifactReady && !proxyComplete && !staleWrapUp)
         {
             timingParts.Add("post-quant validation in progress");
         }
@@ -514,7 +566,7 @@ public partial class MainWindow : Window
         {
             timingParts.Add("proxy run complete");
         }
-        if (capExceededWithoutFinal && !proxyComplete)
+        if (capExceededWithoutFinal && !proxyComplete && !staleWrapUp)
         {
             timingParts.Add("training cap hit; final eval in progress");
         }
@@ -528,6 +580,7 @@ public partial class MainWindow : Window
             proxyComplete,
             waitingOnInitialValidation,
             capExceededWithoutFinal,
+            staleWrapUp,
             stopEarlySeen,
             quantArtifactReady,
             currentStep,
@@ -629,6 +682,7 @@ public partial class MainWindow : Window
         bool proxyComplete,
         bool waitingOnInitialValidation,
         bool capExceededWithoutFinal,
+        bool staleWrapUp,
         bool stopEarlySeen,
         bool quantArtifactReady,
         int currentStep,
@@ -651,6 +705,15 @@ public partial class MainWindow : Window
         if (proxyComplete)
         {
             return "Complete (roundtrip skipped)";
+        }
+
+        if (staleWrapUp)
+        {
+            return quantArtifactReady
+                ? $"Stale after quantized artifact export ({FormatAge(logAge)} since last update)"
+                : stopEarlySeen
+                    ? $"Stale during packaging ({FormatAge(logAge)} since last update)"
+                    : $"Stale during final validation ({FormatAge(logAge)} since last update)";
         }
 
         if (capExceededWithoutFinal)
@@ -763,6 +826,46 @@ public partial class MainWindow : Window
         return "ETA unavailable";
     }
 
+    private static bool IsLikelyStaleWrapUp(
+        string finalValBpb,
+        bool proxyComplete,
+        bool capExceededWithoutFinal,
+        bool stopEarlySeen,
+        bool quantArtifactReady,
+        int warmupDone,
+        int warmupSteps,
+        string latestStepAvg,
+        string latestTrainTime,
+        DateTime runStartTime,
+        DateTime lastLogWriteTime,
+        TimeSpan logAge)
+    {
+        if (finalValBpb.Length > 0 || proxyComplete || !capExceededWithoutFinal)
+        {
+            return false;
+        }
+
+        var stageEstimate = EstimateWrapUpStageDuration(
+            stopEarlySeen,
+            quantArtifactReady,
+            warmupDone,
+            warmupSteps,
+            latestStepAvg,
+            latestTrainTime,
+            runStartTime,
+            lastLogWriteTime
+        );
+
+        if (!stageEstimate.HasValue)
+        {
+            return logAge >= TimeSpan.FromMinutes(10);
+        }
+
+        var graceSeconds = Math.Max(120.0, stageEstimate.Value.TotalSeconds * 0.5);
+        var staleThreshold = stageEstimate.Value + TimeSpan.FromSeconds(graceSeconds);
+        return logAge > staleThreshold;
+    }
+
     private static TimeSpan? EstimateWrapUpRemaining(
         bool stopEarlySeen,
         bool quantArtifactReady,
@@ -773,6 +876,35 @@ public partial class MainWindow : Window
         DateTime runStartTime,
         DateTime lastLogWriteTime,
         TimeSpan logAge)
+    {
+        var stageEstimate = EstimateWrapUpStageDuration(
+            stopEarlySeen,
+            quantArtifactReady,
+            warmupDone,
+            warmupSteps,
+            latestStepAvg,
+            latestTrainTime,
+            runStartTime,
+            lastLogWriteTime
+        );
+        if (!stageEstimate.HasValue)
+        {
+            return null;
+        }
+
+        var remaining = stageEstimate.Value - logAge;
+        return remaining;
+    }
+
+    private static TimeSpan? EstimateWrapUpStageDuration(
+        bool stopEarlySeen,
+        bool quantArtifactReady,
+        int warmupDone,
+        int warmupSteps,
+        string latestStepAvg,
+        string latestTrainTime,
+        DateTime runStartTime,
+        DateTime lastLogWriteTime)
     {
         var validationPassEstimate = EstimateValidationPassDuration(
             stopEarlySeen,
@@ -790,22 +922,15 @@ public partial class MainWindow : Window
         }
 
         var packagingEstimate = TimeSpan.FromMinutes(2);
-        TimeSpan stageEstimate;
         if (quantArtifactReady)
         {
-            stageEstimate = validationPassEstimate.Value;
+            return validationPassEstimate.Value;
         }
-        else if (stopEarlySeen)
+        if (stopEarlySeen)
         {
-            stageEstimate = packagingEstimate + validationPassEstimate.Value;
+            return packagingEstimate + validationPassEstimate.Value;
         }
-        else
-        {
-            stageEstimate = validationPassEstimate.Value + packagingEstimate + validationPassEstimate.Value;
-        }
-
-        var remaining = stageEstimate - logAge;
-        return remaining;
+        return validationPassEstimate.Value + packagingEstimate + validationPassEstimate.Value;
     }
 
     private static TimeSpan? EstimateValidationPassDuration(

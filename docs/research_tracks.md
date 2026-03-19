@@ -34,6 +34,7 @@ Priority order is dictated by the challenge rules:
 - `TERNARY_REG_WEIGHT`
 - `OUTLIER_REG_WEIGHT`
 - `EVAL_CACHE_MIX_WEIGHT`
+- `EVAL_BIGRAM_MIX_WEIGHT`
 - `EVAL_CACHE_SIZE`
 - `FINAL_ROUNDTRIP_EVAL`
 - `ROUNDTRIP_VAL_MAX_TOKENS`
@@ -117,31 +118,66 @@ Use this when ranking experiments on a more faithful local objective:
     - tiny outlier regularization did not help on this local roundtrip track
     - none of the focused QAT sweep runs beat the standing best dense compression-aware run at `2.06085837`
     - the dense compression-aware baseline remains the current best local result
+- Recurrent/shared-block roundtrip sweep:
+  - sweep: `recurtsweep_20260318_1925`
+  - tested:
+    - `16 layers / 8 unique / embed 0` -> `2.25452146`
+    - `18 layers / 6 unique / embed 0` -> `2.28804085`
+    - `16 layers / 8 unique / embed 256` -> `2.28260194`
+    - `18 layers / 6 unique / embed 256` -> `2.34886036`
+  - interpretation:
+    - this branch cuts artifact size aggressively, but quality collapses on the current local roundtrip track
+    - none of these shapes are close to the dense compression-aware baseline
+    - shared-block recurrence stays interesting for the 16 MB objective, but this first pass is not competitive enough to prioritize locally
+- Roundtrip sidecar revisit on top of the winning dense compression setup:
+  - sweep: `sidecarrtsweep_20260318_1942`
+  - best usable result in sweep:
+    - run: `sidecarrtsweep_20260318_1942_c0020_b0030_s8`
+    - knobs: `EVAL_CACHE_MIX_WEIGHT=0.02`, `EVAL_BIGRAM_MIX_WEIGHT=0.03`, `EVAL_CACHE_SIZE=8`
+    - exact final roundtrip result: `val_bpb=2.06132482`, `val_loss=3.48093767`
+    - total artifact: `6,864,315` bytes
+    - delta vs best dense compression baseline: `+0.00046645 bpb` worse
+  - sweep reliability notes:
+    - `c0015_b0020_s8` and `c0020_b0020_s8` stopped before a usable roundtrip result was written
+    - `c0020_b0020_s16` reached artifact export but never wrote `final_int8_zlib_roundtrip_exact`
+  - interpretation:
+    - the sidecar branch is the closest secondary idea so far
+    - it still did not beat the plain dense compression-aware winner
+    - keep it parked as a late-stage add-on, not the current pivot
+
+## Current leader
+
+- `compressrt3090_20260318_175828`
+- dense attention, no sidecar, no recurrence, no factorized embedding
+- `COMPRESSION_REG_WEIGHT=0.005`
+- exact final roundtrip result: `val_bpb=2.06085837`
+- total artifact: `6,839,798` bytes
 
 ## Immediate next step
 
-- Begin the recurrent/shared-block roundtrip sweep
-- keep the compression-aware training path active
-- vary `NUM_LAYERS`, `NUM_UNIQUE_BLOCKS`, and `EMBED_DIM`
+- Pivot into native low-bit shaping on the roundtrip track
+- keep the dense compression-aware baseline fixed
+- add only very small `TERNARY_REG_WEIGHT` values first
+- keep `OUTLIER_REG_WEIGHT=0` until ternary-only behavior is measured cleanly
 - rank experiments by `final_int8_zlib_roundtrip_exact val_bpb`
 
 ## Next experiments
 
-- Zlib-aware QAT baseline:
-  - rank on capped post-roundtrip proxy first
-  - then sweep reconstruction / outlier penalties around the best roundtrip result
-- Recurrent shared-block transformer:
-  - vary `NUM_LAYERS`, `NUM_UNIQUE_BLOCKS`, `EMBED_DIM`
-  - test whether smaller unique depth plus more effective depth improves proxy `val_bpb`
-- Tiny hybrid sidecar model:
-  - revisit only if a small weight sweep can push it under baseline
-  - longer-term version should replace the current recency bias with a real adaptive mixer over:
-    - recent-token cache
-    - tiny n-gram model
-    - neural logits
+- Native low-bit / ternary shaping:
+  - sweep conservative `TERNARY_REG_WEIGHT` values on top of the winning dense compression-aware setup
+  - keep architecture and eval settings fixed
+  - decide first whether ternary pressure helps the actual roundtripped metric at all
+- Compression + ternary interaction:
+  - if a ternary value helps, retune `COMPRESSION_REG_WEIGHT` around that point
+  - only then reconsider tiny outlier suppression
+- Sidecar follow-up, only if low-bit shaping stalls:
+  - rerun the closest sidecar point on a clean single-run path
+  - only continue if it can beat the dense no-sidecar baseline
+  - otherwise keep the sidecar idea as a later ensemble/mixer branch
 
 ## Medium-term work
 
+- Dense winner + sidecar + low-bit combined into one trainer once the individual branches are measured cleanly
 - Global/shared codebook quantization across layers
 - Basis-generated per-layer weights or hypernetwork-style weight generation
 - Test-time adaptation with strict reset semantics
