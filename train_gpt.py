@@ -30,11 +30,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -50,6 +45,9 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     roundtrip_val_max_tokens = int(os.environ.get("ROUNDTRIP_VAL_MAX_TOKENS", "0"))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "0"))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))
+    sw_eval_batch = int(os.environ.get("SW_EVAL_BATCH", "32"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -107,13 +105,12 @@ class Hyperparameters:
     eval_cache_mix_weight = float(os.environ.get("EVAL_CACHE_MIX_WEIGHT", "0.0"))
     eval_bigram_mix_weight = float(os.environ.get("EVAL_BIGRAM_MIX_WEIGHT", "0.0"))
     eval_cache_size = int(os.environ.get("EVAL_CACHE_SIZE", "0"))
+    weight_quantization_bits = int(os.environ.get("WEIGHT_QUANTIZATION_BITS", "8"))
+    embed_quantization_bits = int(os.environ.get("EMBED_QUANTIZATION_BITS", str(weight_quantization_bits)))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -187,13 +184,8 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -234,7 +226,19 @@ def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> T
             f"Validation split is too short for TRAIN_SEQ_LEN={seq_len} and VAL_MAX_TOKENS={max_tokens}"
         )
     return tokens[: usable + 1]
-def eval_val(
+
+
+def forward_eval_logits(args: Hyperparameters, model: nn.Module, x: Tensor) -> Tensor:
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+        logits = model(x, return_logits=True)
+    if (args.eval_cache_mix_weight > 0.0 or args.eval_bigram_mix_weight > 0.0) and args.eval_cache_size > 0:
+        logits = apply_recent_token_bias(
+            logits, x, args.eval_cache_mix_weight, args.eval_bigram_mix_weight, args.eval_cache_size
+        )
+    return logits
+
+
+def eval_val_standard(
     args: Hyperparameters,
     model: nn.Module,
     rank: int,
@@ -245,19 +249,17 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    eval_seq_len: int,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < eval_seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={eval_seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // eval_seq_len
+    total_seqs = (val_tokens.numel() - 1) // eval_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -268,22 +270,18 @@ def eval_val(
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
+            raw_start = batch_seq_start * eval_seq_len
+            raw_end = batch_seq_end * eval_seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                if (args.eval_cache_mix_weight > 0.0 or args.eval_bigram_mix_weight > 0.0) and args.eval_cache_size > 0:
-                    logits = model(x, return_logits=True)
-                    logits = apply_recent_token_bias(
-                        logits, x, args.eval_cache_mix_weight, args.eval_bigram_mix_weight, args.eval_cache_size
-                    )
-                    batch_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="mean").detach()
-                else:
-                    batch_loss = model(x, y).detach()
+            x = local[:-1].reshape(-1, eval_seq_len)
+            y = local[1:].reshape(-1, eval_seq_len)
+            logits = forward_eval_logits(args, model, x)
             batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_loss_sum += F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y.reshape(-1),
+                reduction="sum",
+            ).detach().to(torch.float64)
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
@@ -301,6 +299,120 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    eval_seq_len: int,
+    eval_stride: int,
+) -> tuple[float, float]:
+    if eval_stride <= 0 or eval_stride >= eval_seq_len:
+        raise ValueError(f"EVAL_STRIDE must be in [1, EVAL_SEQ_LEN), got {eval_stride} for EVAL_SEQ_LEN={eval_seq_len}")
+    total_targets = val_tokens.numel() - 1
+    if total_targets < eval_seq_len:
+        raise ValueError(f"validation split too short for EVAL_SEQ_LEN={eval_seq_len}")
+    window_starts = list(range(0, max(total_targets - eval_seq_len, 0) + 1, eval_stride))
+    final_start = total_targets - eval_seq_len
+    if window_starts[-1] != final_start:
+        window_starts.append(final_start)
+    idx_start = (len(window_starts) * rank) // world_size
+    idx_end = (len(window_starts) * (rank + 1)) // world_size
+    covered_until = 0 if idx_start == 0 else min(total_targets, window_starts[idx_start - 1] + eval_seq_len)
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    model.eval()
+    with torch.inference_mode():
+        for batch_start in range(idx_start, idx_end, max(args.sw_eval_batch, 1)):
+            starts = window_starts[batch_start : min(batch_start + max(args.sw_eval_batch, 1), idx_end)]
+            local = torch.stack([val_tokens[ws : ws + eval_seq_len + 1] for ws in starts]).to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+            x = local[:, :-1]
+            y = local[:, 1:]
+            logits = forward_eval_logits(args, model, x)
+            for i, ws in enumerate(starts):
+                window_end = min(ws + eval_seq_len, total_targets)
+                score_start = max(covered_until, ws)
+                if score_start >= window_end:
+                    continue
+                local_start = score_start - ws
+                local_end = window_end - ws
+                scored_logits = logits[i, local_start:local_end]
+                scored_targets = y[i, local_start:local_end]
+                val_loss_sum += F.cross_entropy(
+                    scored_logits.reshape(-1, scored_logits.size(-1)).float(),
+                    scored_targets.reshape(-1),
+                    reduction="sum",
+                ).detach().to(torch.float64)
+                val_token_count += float(scored_targets.numel())
+                prev_ids = x[i, local_start:local_end].reshape(-1)
+                tgt_ids = scored_targets.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+                covered_until = window_end
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    if 0 < args.eval_stride < eval_seq_len:
+        return eval_val_sliding(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            eval_seq_len,
+            args.eval_stride,
+        )
+    return eval_val_standard(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        eval_seq_len,
+    )
 
 
 def apply_recent_token_bias(
@@ -327,10 +439,6 @@ def apply_recent_token_bias(
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -357,6 +465,32 @@ INT8_AXIS_MODE = os.environ.get("INT8_AXIS_MODE", "auto").strip().lower()
 INT8_RESIDUAL_RANK = int(os.environ.get("INT8_RESIDUAL_RANK", "0"))
 INT8_RESIDUAL_BUDGET_BYTES = int(os.environ.get("INT8_RESIDUAL_BUDGET_BYTES", "0"))
 INT8_RESIDUAL_POWER_ITERS = int(os.environ.get("INT8_RESIDUAL_POWER_ITERS", "6"))
+INT8_TARGETED_RESIDUAL_MODE = os.environ.get("INT8_TARGETED_RESIDUAL_MODE", "off").strip().lower()
+WEIGHT_QUANTIZATION_BITS = int(os.environ.get("WEIGHT_QUANTIZATION_BITS", "8"))
+EMBED_QUANTIZATION_BITS = int(os.environ.get("EMBED_QUANTIZATION_BITS", str(WEIGHT_QUANTIZATION_BITS)))
+SUPPORTED_WEIGHT_QUANTIZATION_BITS = {4, 5, 6, 7, 8}
+SUPPORTED_EMBED_QUANTIZATION_BITS = SUPPORTED_WEIGHT_QUANTIZATION_BITS | {16}
+
+
+def quant_qmax(num_bits: int) -> int:
+    if num_bits not in SUPPORTED_WEIGHT_QUANTIZATION_BITS:
+        raise ValueError(f"WEIGHT_QUANTIZATION_BITS must be one of {sorted(SUPPORTED_WEIGHT_QUANTIZATION_BITS)}, got {num_bits}")
+    return (1 << (num_bits - 1)) - 1
+
+
+def tensor_quantization_bits(name: str) -> int:
+    if name == "tok_emb.weight" or name.endswith("lm_head.weight"):
+        if EMBED_QUANTIZATION_BITS not in SUPPORTED_EMBED_QUANTIZATION_BITS:
+            raise ValueError(
+                f"EMBED_QUANTIZATION_BITS must be one of {sorted(SUPPORTED_EMBED_QUANTIZATION_BITS)}, got {EMBED_QUANTIZATION_BITS}"
+            )
+        return EMBED_QUANTIZATION_BITS
+    return WEIGHT_QUANTIZATION_BITS
+
+def residual_target_priority(name: str) -> int:
+    if INT8_TARGETED_RESIDUAL_MODE == "early_proj_combo":
+        return 2 if any(name.startswith(f"blocks.{i}.mlp.proj.weight") or name.startswith(f"blocks.{i}.attn.proj.weight") for i in range(4)) else 0
+    return 0
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -382,8 +516,9 @@ def dequantize_int8_tensor(q: Tensor, s: Tensor, dtype: torch.dtype, axis: int |
         return (q.float() * scale).to(dtype=dtype).contiguous()
     raise ValueError(f"unsupported quant axis {axis} for tensor with ndim={q.ndim}")
 
-def quantize_float_tensor_axis(t: Tensor, axis: int = 0) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_axis(t: Tensor, axis: int = 0, num_bits: int = 8) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    qmax = quant_qmax(num_bits)
     if t32.ndim == 2:
         if axis not in (0, 1):
             raise ValueError(f"axis must be 0 or 1 for 2D tensors, got {axis}")
@@ -394,8 +529,8 @@ def quantize_float_tensor_axis(t: Tensor, axis: int = 0) -> tuple[Tensor, Tensor
             else torch.empty((view.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(view, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8)
+        scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8)
         if axis == 1:
             q = q.transpose(0, 1)
         q = q.contiguous()
@@ -403,8 +538,8 @@ def quantize_float_tensor_axis(t: Tensor, axis: int = 0) -> tuple[Tensor, Tensor
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
 
 def relative_quant_error(t: Tensor, q: Tensor, s: Tensor, axis: int | None = None) -> float:
@@ -413,22 +548,22 @@ def relative_quant_error(t: Tensor, q: Tensor, s: Tensor, axis: int | None = Non
     denom = target.square().mean().clamp_min(1e-12)
     return float(((target - recon).square().mean() / denom).item())
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor, dict[str, object] | None]:
+def quantize_float_tensor(t: Tensor, num_bits: int = 8) -> tuple[Tensor, Tensor, dict[str, object] | None]:
     if t.ndim == 2 and INT8_AXIS_MODE in {"auto", "col", "row"}:
         if INT8_AXIS_MODE == "col":
-            q, s = quantize_float_tensor_axis(t, axis=1)
-            return q, s, {"scheme": "per_channel", "axis": 1}
-        q_row, s_row = quantize_float_tensor_axis(t, axis=0)
+            q, s = quantize_float_tensor_axis(t, axis=1, num_bits=num_bits)
+            return q, s, {"scheme": "per_channel", "axis": 1, "bits": num_bits}
+        q_row, s_row = quantize_float_tensor_axis(t, axis=0, num_bits=num_bits)
         if INT8_AXIS_MODE == "row":
-            return q_row, s_row, {"scheme": "per_channel", "axis": 0}
-        q_col, s_col = quantize_float_tensor_axis(t, axis=1)
+            return q_row, s_row, {"scheme": "per_channel", "axis": 0, "bits": num_bits}
+        q_col, s_col = quantize_float_tensor_axis(t, axis=1, num_bits=num_bits)
         row_error = relative_quant_error(t, q_row, s_row, axis=0)
         col_error = relative_quant_error(t, q_col, s_col, axis=1)
         if col_error < row_error or (col_error == row_error and tensor_nbytes(s_col) < tensor_nbytes(s_row)):
-            return q_col, s_col, {"scheme": "per_channel", "axis": 1, "relative_error": col_error}
-        return q_row, s_row, {"scheme": "per_channel", "axis": 0, "relative_error": row_error}
-    q, s = quantize_float_tensor_axis(t, axis=0)
-    return q, s, None
+            return q_col, s_col, {"scheme": "per_channel", "axis": 1, "relative_error": col_error, "bits": num_bits}
+        return q_row, s_row, {"scheme": "per_channel", "axis": 0, "relative_error": row_error, "bits": num_bits}
+    q, s = quantize_float_tensor_axis(t, axis=0, num_bits=num_bits)
+    return q, s, {"bits": num_bits}
 
 def approximate_rank1_residual(residual: Tensor, power_iters: int) -> tuple[Tensor, Tensor, float]:
     if residual.ndim != 2 or residual.numel() == 0:
@@ -455,12 +590,6 @@ def approximate_rank1_residual(residual: Tensor, power_iters: int) -> tuple[Tens
     return left, right, benefit
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-channel int8 for 2D float tensors, with auto row/column axis selection
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    # - optional rank-1 fp16 residuals for the most byte-efficient tensors
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -495,6 +624,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
+        quant_bits = tensor_quantization_bits(name)
+        if quant_bits == 16:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
@@ -504,7 +640,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s, meta = quantize_float_tensor(t)
+        q, s, meta = quantize_float_tensor(t, num_bits=quant_bits)
         if meta is not None:
             qmeta[name] = meta
         quantized[name] = q
@@ -524,6 +660,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
                         "right": right,
                         "benefit": benefit,
                         "bytes": residual_bytes,
+                        "priority": residual_target_priority(name),
                     }
                 )
 
@@ -532,7 +669,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     remaining_residual_budget = INT8_RESIDUAL_BUDGET_BYTES
     if remaining_residual_budget > 0 and residual_rank1_candidates:
         residual_rank1_candidates.sort(
-            key=lambda item: (float(item["benefit"]) / max(int(item["bytes"]), 1), float(item["benefit"])),
+            key=lambda item: (int(item["priority"]), float(item["benefit"]) / max(int(item["bytes"]), 1), float(item["benefit"])),
             reverse=True,
         )
         for item in residual_rank1_candidates:
@@ -549,7 +686,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += residual_bytes
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_channel_v2",
+        "__quant_format__": "intx_clean_per_channel_v3",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -627,8 +764,11 @@ def compression_regularizer(
     for offset in range(count):
         name, param = candidates[(start + offset) % len(candidates)]
         view = maybe_slice_matrix_cols(param.float(), args.compression_reg_max_cols, step * 131 + offset * 17)
+        quant_bits = tensor_quantization_bits(name)
+        if quant_bits == 16:
+            continue
         with torch.no_grad():
-            q, s, meta = quantize_float_tensor(view.detach())
+            q, s, meta = quantize_float_tensor(view.detach(), num_bits=quant_bits)
             axis = 0 if meta is None else int(meta["axis"])
             recon = dequantize_int8_tensor(q, s, dtype=torch.float32, axis=axis)
         reg = F.mse_loss(view, recon, reduction="mean")
@@ -670,7 +810,9 @@ def compression_regularizer(
             reg = reg + args.outlier_reg_weight * (view.abs().amax(dim=1).mean() / (view.abs().mean() + 1e-6))
         losses.append(reg)
         sampled_names.append(name)
-    return torch.stack(losses).mean() if losses else torch.zeros((), device=device), sampled_names
+    if not losses:
+        return torch.zeros((), device=device), []
+    return torch.stack(losses).mean(), sampled_names
 
 
 # -----------------------------
@@ -1105,7 +1247,8 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
+    eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    val_tokens = load_validation_tokens(args.val_files, eval_seq_len, args.val_max_tokens)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -1227,6 +1370,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"eval_mode:seq_len:{eval_seq_len} stride:{args.eval_stride} sw_eval_batch:{args.sw_eval_batch}")
     log0(
         f"local_proxy:save_raw_checkpoint:{args.save_raw_checkpoint} "
         f"final_roundtrip_eval:{args.final_roundtrip_eval} "
@@ -1239,6 +1383,10 @@ def main() -> None:
         f"scale:{args.compression_scale_reg_weight} rank1:{args.compression_rank1_reg_weight} "
         f"ternary:{args.ternary_reg_weight} "
         f"outlier:{args.outlier_reg_weight} candidates:{len(compression_reg_tensors)}"
+    )
+    log0(
+        f"quant_bits:weights:{args.weight_quantization_bits} "
+        f"embed:{args.embed_quantization_bits} axis_mode:{INT8_AXIS_MODE}"
     )
     log0(
         f"eval_cache:mix_weight:{args.eval_cache_mix_weight} "
@@ -1441,6 +1589,8 @@ def main() -> None:
         log0(
             f"quant_config:axis_mode:{INT8_AXIS_MODE} residual_rank:{INT8_RESIDUAL_RANK} "
             f"residual_budget_bytes:{INT8_RESIDUAL_BUDGET_BYTES} "
+            f"targeted_residual_mode:{INT8_TARGETED_RESIDUAL_MODE} "
+            f"weight_bits:{args.weight_quantization_bits} embed_bits:{args.embed_quantization_bits} "
             f"residual_tensors:{quant_stats['num_rank1_residual_tensors']} "
             f"residual_bytes:{quant_stats['rank1_residual_bytes']}"
         )
@@ -1449,7 +1599,7 @@ def main() -> None:
     if args.final_roundtrip_eval:
         roundtrip_val_tokens = val_tokens
         if args.roundtrip_val_max_tokens > 0:
-            roundtrip_val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.roundtrip_val_max_tokens)
+            roundtrip_val_tokens = load_validation_tokens(args.val_files, eval_seq_len, args.roundtrip_val_max_tokens)
             if master_process:
                 log0(
                     f"roundtrip_val_loader:tokens:{roundtrip_val_tokens.numel() - 1} "

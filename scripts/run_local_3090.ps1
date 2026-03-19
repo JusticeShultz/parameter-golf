@@ -10,6 +10,9 @@ param(
     [int]$ValBatchSize = 65536,
     [int]$ValMaxTokens = 4194304,
     [int]$RoundtripValMaxTokens = 2097152,
+    [int]$EvalSeqLen = 0,
+    [int]$EvalStride = 0,
+    [int]$SwEvalBatch = 32,
     [int]$TrainLogEvery = 10,
     [int]$ValLossEvery = 50,
     [int]$WarmupSteps = 0,
@@ -24,6 +27,7 @@ param(
     [string]$Int8AxisMode = "auto",
     [int]$Int8ResidualRank = 1,
     [int]$Int8ResidualBudgetBytes = 65536,
+    [string]$Int8TargetedResidualMode = "off",
     [double]$CompressionRegWeight = 0.02,
     [int]$CompressionRegInterval = 4,
     [int]$CompressionRegWarmupSteps = 10,
@@ -37,6 +41,8 @@ param(
     [double]$EvalCacheMixWeight = 0.03,
     [double]$EvalBigramMixWeight = 0.0,
     [int]$EvalCacheSize = 8,
+    [int]$WeightQuantizationBits = 8,
+    [int]$EmbedQuantizationBits = 8,
     [int]$SaveRawCheckpoint = 0,
     [int]$FinalRoundtripEval = 0,
     [switch]$Background
@@ -75,11 +81,15 @@ $env:SDP_BACKEND = "math"
 $env:INT8_AXIS_MODE = $Int8AxisMode
 $env:INT8_RESIDUAL_RANK = $Int8ResidualRank.ToString()
 $env:INT8_RESIDUAL_BUDGET_BYTES = $Int8ResidualBudgetBytes.ToString()
+$env:INT8_TARGETED_RESIDUAL_MODE = $Int8TargetedResidualMode
 $env:TRAIN_BATCH_TOKENS = $TrainBatchTokens.ToString()
 $env:ITERATIONS = $Iterations.ToString()
 $env:VAL_BATCH_SIZE = $ValBatchSize.ToString()
 $env:VAL_MAX_TOKENS = $ValMaxTokens.ToString()
 $env:ROUNDTRIP_VAL_MAX_TOKENS = $RoundtripValMaxTokens.ToString()
+$env:EVAL_SEQ_LEN = $EvalSeqLen.ToString()
+$env:EVAL_STRIDE = $EvalStride.ToString()
+$env:SW_EVAL_BATCH = $SwEvalBatch.ToString()
 $env:TRAIN_LOG_EVERY = $TrainLogEvery.ToString()
 $env:VAL_LOSS_EVERY = $ValLossEvery.ToString()
 $env:WARMUP_STEPS = $WarmupSteps.ToString()
@@ -99,6 +109,8 @@ $env:OUTLIER_REG_WEIGHT = $OutlierRegWeight.ToString([System.Globalization.Cultu
 $env:EVAL_CACHE_MIX_WEIGHT = $EvalCacheMixWeight.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $env:EVAL_BIGRAM_MIX_WEIGHT = $EvalBigramMixWeight.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $env:EVAL_CACHE_SIZE = $EvalCacheSize.ToString()
+$env:WEIGHT_QUANTIZATION_BITS = $WeightQuantizationBits.ToString()
+$env:EMBED_QUANTIZATION_BITS = $EmbedQuantizationBits.ToString()
 
 $scriptPath = Join-Path $root "train_gpt.py"
 $stdoutPath = Join-Path $root "logs\$RunId.stdout.txt"

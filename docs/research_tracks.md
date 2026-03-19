@@ -299,16 +299,141 @@ Use this when ranking experiments on a more faithful local objective:
     - `l14_d560` is the current best local result overall
     - `l12_d608` is slightly worse on fixed-step BPB but notably faster per step, so it remains a plausible wallclock-oriented backup shape
     - the first deeper SP4096 point (`l15_d544`) pushed just over the cap, which suggests the next useful local refinement is a slightly narrower deeper sweep
+- SP4096 frontier refinement:
+  - sweep: `sp4096frontier_fixedstep_20260319_024311`
+  - completed results:
+    - `l15_d528` -> `1.90758423` at `15,313,341` bytes
+    - `l16_d512` -> `1.90408017` at `15,413,246` bytes
+    - `l15_d540_h10` -> `1.90686721` at `15,890,169` bytes
+  - interpretation:
+    - both deeper/narrower fallback shapes stayed under the cap but regressed versus `l14_d560`
+    - the higher-byte `15x540` compromise also stayed under the cap and still regressed versus `l14_d560`
+    - depth is not obviously dead, but this local SP4096 frontier no longer looks like it will be beaten by small shape tweaks alone
+    - the next best branch should move off pure shape refinement and onto export-side improvements targeted at the current `l14_d560` control
+- Sliding-window eval on top of the SP4096 leader:
+  - run: `sp4096slide_20260319_140111`
+  - exact final roundtrip result: `1.93999302`
+  - total artifact: `15,874,851` bytes
+  - delta vs plain SP4096 `l14_d560` leader: `+0.04669386 bpb` worse
+  - interpretation:
+    - sliding-window eval regressed on this branch
+    - it moved the same `14x560` SP4096 recipe from `1.89329916` to `1.93999302`, about `2.47%` higher bpb
+    - unlike the earlier mixed-quant combo, this kept the proven 8-bit export path intact, so the regression is attributable to eval alone
+    - sliding-window eval should stay experimental, not part of the control path, unless a different stride/sequence-length setup changes the result
+- Export-side MLP permutation on the SP4096 leader:
+  - run: `sp4096mlpperm_20260319_150137`
+  - same-checkpoint baseline export:
+    - `1.89329916` at `15,874,851` bytes
+  - MLP-hidden-unit permuted export:
+    - `1.89331845` at `15,853,440` bytes
+  - interpretation:
+    - this exact symmetry-preserving MLP permutation was almost quality-neutral but slightly worse on BPB
+    - it did reduce artifact size by `21,411` bytes, so the ordering idea is not useless, but this heuristic is not yet a score winner
+    - export-side permutation should stay open as a compression trick, but not as the next primary optimization lane
+- Tensor sensitivity mapping on the SP4096 leader checkpoint:
+  - run: `sp4096mlpperm_20260319_150137.sensitivity`
+  - baseline export:
+    - `1.89329916` at `15,874,851` bytes
+  - strongest measured single-tensor protections in the first top-8 scan:
+    - `tok_emb.weight` -> `1.89269052` at `17,723,296` bytes
+    - `blocks.0.mlp.proj.weight` -> `1.89225616` at `16,842,104` bytes
+    - `blocks.1.mlp.proj.weight` -> `1.89284998` at `16,835,628` bytes
+  - interpretation:
+    - `tok_emb.weight` and early `mlp.proj.weight` tensors are the most quantization-sensitive tensors seen so far
+    - `mlp.fc.weight` rows are much less worth protecting than the matching `mlp.proj.weight`
+    - full fp16 protection is far too byte-expensive for the gains measured here
+    - the next heterogeneous export work should target partial / low-rank / selective protection of projection weights, not blanket keep-float exceptions
+- Targeted residual allocation on the SP4096 leader checkpoint:
+  - run: `sp4096mlpperm_20260319_150137.targetedresid`
+  - baseline export in this harness:
+    - `1.89331212` at `15,808,930` bytes
+  - targeted variants:
+    - `resid_all_mlp_proj` -> `1.89312262` at `15,855,678` bytes
+    - `resid_early_mlp_proj` -> `1.89309741` at `15,822,543` bytes
+    - `resid_all_attn_proj` -> `1.89330189` at `15,841,186` bytes
+    - `resid_early_combo` -> `1.89308554` at `15,831,628` bytes
+  - interpretation:
+    - concentrating the same rank-1 residual budget on early projection tensors is better than the default global allocation
+    - the best variant so far is the early combo of `mlp.proj` + `attn.proj`, improving BPB by `0.00022659` for only `22,698` extra bytes
+    - this is still a tiny gain, but it is a cleaner positive result than the first MLP permutation heuristic
+    - the next practical step is to fold targeted residual allocation into the trainer/export path and re-run the SP4096 leader with it enabled
+- End-to-end targeted residual rerun:
+  - run: `sp4096targeted_20260319_155429`
+  - config:
+    - same SP4096 `14x560` dense leader
+    - `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo`
+  - exact final roundtrip result: `1.89309428`
+  - total artifact: `15,875,631` bytes
+  - delta vs prior SP4096 leader: `-0.00020488 bpb` better, `+6,560` bytes
+  - interpretation:
+    - the checkpoint-level targeted residual gain survives end to end
+    - this is the first export-side change after the SP4096 pivot that produced a real end-to-end improvement on the trusted local track
+    - the gain is small, but it is clean and comes at a tiny artifact cost
+- End-to-end targeted residual budget refinement:
+  - runs:
+    - `sp4096targeted_b131072_20260319_1620`
+    - `sp4096targeted_b98304_20260319_1633`
+  - completed results:
+    - `budget=131072` -> `1.89308887` at `15,940,119` bytes
+    - `budget=98304` -> `1.89306630` at `15,907,581` bytes
+  - interpretation:
+    - the first targeted-residual win was real and continues to improve with a modest budget increase
+    - `98304` is currently the best end-to-end targeted-residual budget under the cap
+    - pushing the budget to `131072` still helps relative to the old `65536` point, but not as much as the tighter `98304` setting
+- Training-side compression regularizer refinement on the SP4096 targeted-residual leader:
+  - run: `sp4096compw0045_20260319_1650`
+  - config:
+    - same SP4096 `14x560` control
+    - `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo`
+    - `INT8_RESIDUAL_BUDGET_BYTES=98304`
+    - `COMPRESSION_REG_WEIGHT=0.0045`
+  - exact final roundtrip result: `1.89258040`
+  - total artifact: `15,906,874` bytes
+  - delta vs prior `budget=98304` leader: `-0.00048590 bpb` better, `-707` bytes
+  - interpretation:
+    - this is the first materially larger gain after the SP4096 pivot in a while
+    - the old `COMPRESSION_REG_WEIGHT=0.005` point was not locally optimal for the stronger SP4096 + targeted-residual regime
+    - the next sensible move is to bracket downward around `0.0045` before returning to export-only micro-optimization
+- Compression-weight bracket follow-up:
+  - runs:
+    - `sp4096compw0040_20260319_1655`
+    - `sp4096compw00425_20260319_1700`
+  - completed results:
+    - `0.0040` -> `1.89271463` at `15,907,465` bytes
+    - `0.00425` -> `1.89293788` at `15,906,920` bytes
+  - interpretation:
+    - both points are worse than the `0.0045` leader
+    - the lower side of the bracket is now closed
+    - the next useful check is the upper side, not more runs below `0.0045`
+- Targeted residual + MLP permutation combo on the SP4096 leader checkpoint:
+  - sweep:
+    - `sp4096perm_targeted_b65536_20260319_161528`
+    - `sp4096perm_targeted_b131072_20260319_161603`
+    - `sp4096perm_targeted_b196608_20260319_161639`
+    - `sp4096perm_targeted_b262144_20260319_161715`
+  - best under-cap result:
+    - `budget=131072`, targeted residual baseline export -> `1.89308887` at `15,940,119` bytes
+    - `budget=131072`, targeted residual + MLP permutation -> `1.89307739` at `15,917,517` bytes
+  - interpretation:
+    - the MLP permutation heuristic becomes useful once paired with the stronger targeted residual allocation
+    - at `131072` residual-budget bytes, permutation both improves BPB and saves `22,602` bytes versus the non-permuted targeted export
+    - around the tighter end-to-end winner, permutation is no longer clearly helpful:
+      - at `98304`, it slightly regressed BPB
+      - at `114688`, it was nearly neutral but still not clearly superior to the plain `98304` targeted export
+    - larger targeted budgets (`196608`, `262144`) do not improve enough to justify the extra bytes
+    - this is now the best checkpoint-only export setting seen so far for the SP4096 `14x560` control
 
 ## Current leader
 
-- `sp4096isobyte_fixedstep_20260319_022236_l14_d560`
+- `sp4096compw0045_20260319_1650`
 - dense attention, no sidecar, no recurrence, no factorized embedding
 - `VOCAB_SIZE=4096`, tied embeddings
-- `COMPRESSION_REG_WEIGHT=0.005`
+- `COMPRESSION_REG_WEIGHT=0.0045`
 - `COMPRESSION_GRID_REG_WEIGHT=0.10`
-- fixed-step exact final roundtrip result: `val_bpb=1.89329916`
-- total artifact: `15,869,071` bytes
+- `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo`
+- `INT8_RESIDUAL_BUDGET_BYTES=98304`
+- fixed-step exact final roundtrip result: `val_bpb=1.89258040`
+- total artifact: `15,906,874` bytes
 - best wallclock-track reference remains `compressrt3090_20260318_175828` at `2.06085837`
 
 ## Regime correction
@@ -323,26 +448,29 @@ Use this when ranking experiments on a more faithful local objective:
 
 ## Immediate next step
 
-- Keep the SP1024 `14x576` run as the baseline control and the SP4096 `14x560` run as the new frontier control
-- keep `COMPRESSION_REG_WEIGHT=0.005` and `COMPRESSION_GRID_REG_WEIGHT=0.10`
+- Keep the SP1024 `14x576` run as the baseline control and the plain SP4096 `14x560` run as the frontier control
+- keep `COMPRESSION_GRID_REG_WEIGHT=0.10`
 - treat tokenizer changes as a real branch, not a deferred curiosity
-- next tokenizer-aware experiments should stay near the cap:
-  - refine the SP4096 depth/width trade in the `15.7 MB` to `16.0 MB` band
-  - keep a close eye on step time, because `l12_d608` was materially faster than `l14_d560`
+- hold `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo` and `INT8_RESIDUAL_BUDGET_BYTES=98304` fixed for now
+- bracket `COMPRESSION_REG_WEIGHT` around the new `0.0045` winner before spending more time on export-only checkpoint studies
+- lower-side checks `0.0040` and `0.00425` have both regressed; test `0.00475` next
+- only return to export-side micro-tuning once the training-side compression weight stops moving the score materially
 - continue ranking ideas by `final_int8_zlib_roundtrip_exact val_bpb`
 
 ## Next experiments
 
 - SP4096 frontier refinement:
-  - test slightly narrower deeper shapes like `15x528` and `16x512`
-  - compare them against the current `14x560` leader and the faster `12x608` backup
-  - stay under `16,000,000` bytes
+  - parked after `15x528`, `16x512`, and `15x540` all lost to `14x560`
+  - revisit only if a different head geometry or export path makes deeper shapes more attractive
 - Export-side symmetry-aware permutation:
-  - apply function-preserving reordering of MLP channels / attention heads before export
-  - test whether the grid-alignment hint can be turned into a larger zlib win without quality loss
+  - initial MLP-only pass gave a tiny size win but slightly worse BPB
+  - the same heuristic becomes promising once combined with targeted residual allocation
+  - do not prioritize broader permutation heuristics until the `budget=131072` targeted export is confirmed end to end
 - Tensor sensitivity mapping / heterogeneous export allocation:
-  - measure which tensors hurt roundtrip BPB most when quantized
-  - spend residual / protection budget selectively instead of globally
+  - first pass complete on the top quantized tensors of the SP4096 leader
+  - targeted residual allocation on early projection tensors is the first promising sub-cap result
+  - `INT8_RESIDUAL_BUDGET_BYTES=98304` is now the best confirmed end-to-end budget under the cap
+  - avoid full keep-float unless the byte cost can be offset elsewhere
 - Export-aware compression regularizer:
   - continue aligning sampled training-time regularization with the actual export path
   - hold `COMPRESSION_GRID_REG_WEIGHT=0.10` fixed unless new evidence suggests otherwise
