@@ -398,13 +398,15 @@ Use this when ranking experiments on a more faithful local objective:
   - runs:
     - `sp4096compw0040_20260319_1655`
     - `sp4096compw00425_20260319_1700`
+    - `sp4096compw00475_20260319_1710`
   - completed results:
     - `0.0040` -> `1.89271463` at `15,907,465` bytes
     - `0.00425` -> `1.89293788` at `15,906,920` bytes
+    - `0.00475` -> `1.89302752` at `15,907,662` bytes
   - interpretation:
-    - both points are worse than the `0.0045` leader
-    - the lower side of the bracket is now closed
-    - the next useful check is the upper side, not more runs below `0.0045`
+    - both lower-side checks and the upper-side `0.00475` check are worse than the `0.0045` leader
+    - the bracket is effectively closed around `COMPRESSION_REG_WEIGHT=0.0045` on the trusted local SP4096 track
+    - further local search should stop treating compression-weight micro-sweeps as the primary frontier lever
 - Targeted residual + MLP permutation combo on the SP4096 leader checkpoint:
   - sweep:
     - `sp4096perm_targeted_b65536_20260319_161528`
@@ -436,32 +438,77 @@ Use this when ranking experiments on a more faithful local objective:
 - total artifact: `15,906,874` bytes
 - best wallclock-track reference remains `compressrt3090_20260318_175828` at `2.06085837`
 
+## Recovered H100 findings
+
+- Runpod grant session used `8x NVIDIA H100 80GB HBM3` on pod `awrxpa5ou3rqcx`
+- recovered artifacts and notes are saved in:
+  - [runpod_h100_session_20260320_recovery.md](/C:/Users/Justice/Desktop/FunProject/logs/runpod_h100_session_20260320_recovery.md)
+  - [h100send_sp1024_d576_l14_20260320_013957.recovered.txt](/C:/Users/Justice/Desktop/FunProject/logs/h100send_sp1024_d576_l14_20260320_013957.recovered.txt)
+  - [h100send_sp1024_9x512_compgrid_20260320_015442.partial.txt](/C:/Users/Justice/Desktop/FunProject/logs/h100send_sp1024_9x512_compgrid_20260320_015442.partial.txt)
+- Recovered complete H100 run:
+  - `h100send_sp1024_d576_l14_20260320_013957`
+  - full published `fineweb10B_sp1024`
+  - `14x576`, dense attention, `COMPRESSION_REG_WEIGHT=0.005`, `COMPRESSION_GRID_REG_WEIGHT=0.10`
+  - timed stop: `step 6821/20000` at `600012ms`, `step_avg 87.97ms`
+  - pre-quant metric at stop: `val_bpb 1.1939`
+  - exact post-roundtrip metric: `final_int8_zlib_roundtrip_exact val_bpb 1.19816494`
+  - artifact: `30,904,580` bytes
+- Interpretation of the recovered complete H100 run:
+  - the training-side compression/export-aware branch transferred strongly on real `8xH100`
+  - score was leaderboard-competitive on BPB alone
+  - artifact size was massively over the `16,000,000`-byte cap, so the run is invalid as a submission
+- Recovered partial H100 run:
+  - `h100send_sp1024_9x512_compgrid_20260320_015442`
+  - full published `fineweb10B_sp1024`
+  - baseline-sized `9x512` shape with `COMPRESSION_REG_WEIGHT=0.005`, `COMPRESSION_GRID_REG_WEIGHT=0.10`
+  - healthy through `step 1000/20000`
+  - throughput stabilized around `44.5ms/step`, which is essentially baseline-class
+  - final metric was lost when Runpod stopped and removed the pod for low balance
+- H100 session takeaway:
+  - the project is not failing on quality
+  - it is failing on cap discipline when the model is allowed to grow too large
+  - the first real submission-shaped H100 rerun target is now the smaller `9x512` compression-aware branch, not another oversized near-cap dense branch
+
 ## Regime correction
 
 - The trusted local dense control is now in the near-cap regime, not the old `6.66 MB` regime.
 - That is why the dense iso-byte and high-cap frontier sweeps changed the project direction so much.
 - Many earlier negative results were gathered in an under-byte-spent regime and should not be treated as globally final.
+- The local SP4096 winner was built on a retokenized `120k` selected-doc subset, not a published full challenge export.
+- That makes it a strong research signal, but not a direct H100 submission path until a full published SP4096 export exists or is rebuilt with enough compute/time to make that legitimate.
 - The trustworthy questions now are:
   - how should the remaining byte budget be spent near the cap?
   - which export-aware or tokenizer-aware changes still help once the dense control is already strong?
   - how should the remaining cap headroom be spent inside the stronger SP4096 regime?
 
-## Immediate next step
+## Immediate next step when credits return
 
-- Keep the SP1024 `14x576` run as the baseline control and the plain SP4096 `14x560` run as the frontier control
-- keep `COMPRESSION_GRID_REG_WEIGHT=0.10`
-- treat tokenizer changes as a real branch, not a deferred curiosity
-- hold `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo` and `INT8_RESIDUAL_BUDGET_BYTES=98304` fixed for now
-- bracket `COMPRESSION_REG_WEIGHT` around the new `0.0045` winner before spending more time on export-only checkpoint studies
-- lower-side checks `0.0040` and `0.00425` have both regressed; test `0.00475` next
-- only return to export-side micro-tuning once the training-side compression weight stops moving the score materially
-- continue ranking ideas by `final_int8_zlib_roundtrip_exact val_bpb`
+- Freeze the local SP4096 branch as the research leader, not the immediate deployment target
+- Keep `COMPRESSION_GRID_REG_WEIGHT=0.10`
+- Keep the local SP4096 export settings fixed at:
+  - `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo`
+  - `INT8_RESIDUAL_BUDGET_BYTES=98304`
+  - `COMPRESSION_REG_WEIGHT=0.0045`
+- Treat the recovered H100 `14x576` result as proof of quality transfer, but not as a legal shape
+- First rerun target on the next H100 session:
+  - full-data `SP1024`
+  - `9x512`
+  - `COMPRESSION_REG_WEIGHT=0.005`
+  - `COMPRESSION_GRID_REG_WEIGHT=0.10`
+  - otherwise baseline-class batching and export settings
+- Only return to larger H100 shapes after a cap-legal run is in hand
+- Continue ranking ideas by `final_int8_zlib_roundtrip_exact val_bpb`, but separate:
+  - local subset research winners
+  - full-data H100 submission-shaped candidates
 
 ## Next experiments
 
 - SP4096 frontier refinement:
   - parked after `15x528`, `16x512`, and `15x540` all lost to `14x560`
   - revisit only if a different head geometry or export path makes deeper shapes more attractive
+- H100 rerun target:
+  - highest-priority remote rerun is the lost `SP1024 9x512 + compression/grid` run
+  - do not spend new H100 credits on the over-cap `14x576` branch unless the export path changes drastically
 - Export-side symmetry-aware permutation:
   - initial MLP-only pass gave a tiny size win but slightly worse BPB
   - the same heuristic becomes promising once combined with targeted residual allocation
@@ -503,3 +550,4 @@ Use this when ranking experiments on a more faithful local objective:
 - full tokenizer redesign beyond the SP1024 vs SP4096 sanity branch
 - aggressive code-size golf
 - heavy hyperparameter brute force
+- additional H100 spend without enough balance to finish and preserve logs
