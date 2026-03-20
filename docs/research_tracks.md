@@ -469,6 +469,51 @@ Use this when ranking experiments on a more faithful local objective:
   - it is failing on cap discipline when the model is allowed to grow too large
   - the first real submission-shaped H100 rerun target is now the smaller `9x512` compression-aware branch, not another oversized near-cap dense branch
 
+## Recovered 1x H100 findings
+
+- Follow-up Runpod session used `1x H100 SXM`
+- all remote outputs from this session were copied back locally before teardown:
+  - [h1001x_sp1024_9x512_compgrid_20260320_030259](/C:/Users/Justice/Desktop/FunProject/logs/remote/h1001x_sp1024_9x512_compgrid_20260320_030259)
+  - [h1001x_sp1024_9x512_plain_20260320_031944](/C:/Users/Justice/Desktop/FunProject/logs/remote/h1001x_sp1024_9x512_plain_20260320_031944)
+  - [h1001x_sp1024_9x512_targeted_20260320_033606](/C:/Users/Justice/Desktop/FunProject/logs/remote/h1001x_sp1024_9x512_targeted_20260320_033606)
+- Published `fineweb10B_sp1024` download on `1x H100` took about `2m 22s`
+- Complete legal full-data runs on published `SP1024`:
+  - `h1001x_sp1024_9x512_compgrid_20260320_030259`
+    - `9x512`, dense attention
+    - `COMPRESSION_REG_WEIGHT=0.005`
+    - `COMPRESSION_GRID_REG_WEIGHT=0.10`
+    - `INT8_RESIDUAL_RANK=1`
+    - `INT8_RESIDUAL_BUDGET_BYTES=65536`
+    - stop: `step 1849/20000` at `600103ms`, `step_avg 324.56ms`
+    - exact post-roundtrip metric: `final_int8_zlib_roundtrip_exact val_bpb 1.31756308`
+    - artifact: `14,847,999` bytes
+  - `h1001x_sp1024_9x512_plain_20260320_031944`
+    - same `9x512` shape, no compression/grid regularization
+    - `INT8_RESIDUAL_RANK=1`
+    - `INT8_RESIDUAL_BUDGET_BYTES=65536`
+    - stop: `step 1871/20000` at `600162ms`, `step_avg 320.77ms`
+    - exact post-roundtrip metric: `final_int8_zlib_roundtrip_exact val_bpb 1.31693524`
+    - artifact: `14,877,547` bytes
+  - `h1001x_sp1024_9x512_targeted_20260320_033606`
+    - same `9x512` shape, no compression/grid regularization
+    - `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo`
+    - `INT8_RESIDUAL_BUDGET_BYTES=98304`
+    - stop: `step 1871/20000` at `600337ms`, `step_avg 320.69ms`
+    - exact post-roundtrip metric: `final_int8_zlib_roundtrip_exact val_bpb 1.31661720`
+    - artifact: `14,912,837` bytes
+- 1x H100 takeaway:
+  - all three runs stayed safely under the `16,000,000`-byte cap
+  - the plain `9x512` full-data control slightly beat the compression/grid variant
+  - targeted residual allocation then slightly beat the plain control end to end
+  - current best recovered legal full-data H100 run is:
+    - `h1001x_sp1024_9x512_targeted_20260320_033606`
+    - `final_int8_zlib_roundtrip_exact val_bpb 1.31661720`
+    - `14,912,837` bytes
+  - this is not leaderboard-competitive, but it is a real legal full-data H100 datapoint and a stronger remote control than the previously lost partial run
+  - the local SP4096 / compression-grid story does not transfer mechanically:
+    - on full-data `SP1024 1xH100`, compression/grid lost to the plain control
+    - export-side targeted residual allocation still transferred as a small positive
+
 ## Regime correction
 
 - The trusted local dense control is now in the near-cap regime, not the old `6.66 MB` regime.
@@ -490,16 +535,33 @@ Use this when ranking experiments on a more faithful local objective:
   - `INT8_RESIDUAL_BUDGET_BYTES=98304`
   - `COMPRESSION_REG_WEIGHT=0.0045`
 - Treat the recovered H100 `14x576` result as proof of quality transfer, but not as a legal shape
+- Treat the recovered `1x H100` `9x512 + targeted residual` run as the current legal full-data remote control
 - First rerun target on the next H100 session:
   - full-data `SP1024`
   - `9x512`
-  - `COMPRESSION_REG_WEIGHT=0.005`
-  - `COMPRESSION_GRID_REG_WEIGHT=0.10`
-  - otherwise baseline-class batching and export settings
+  - `INT8_TARGETED_RESIDUAL_MODE=early_proj_combo`
+  - `INT8_RESIDUAL_BUDGET_BYTES=98304`
+  - only reintroduce compression/grid if a new full-data result justifies it
 - Only return to larger H100 shapes after a cap-legal run is in hand
 - Continue ranking ideas by `final_int8_zlib_roundtrip_exact val_bpb`, but separate:
   - local subset research winners
   - full-data H100 submission-shaped candidates
+
+## Non-negotiable remote-run rule
+
+- Every paid remote run must save results locally before the pod is allowed to die.
+- Minimum required pullback for every H100 / paid Runpod session:
+  - the full remote text log
+  - the compressed artifact file (`final_model.int8.ptz`) if one was produced
+  - any auxiliary metadata needed to interpret the run (`submission.json`, driver log, launch script, exact env/config)
+- This applies even when the run is obviously bad, over-cap, or incomplete.
+- If balance is low, results must be copied down before starting another run.
+- We do not spend money again on remote compute unless the recovery path is part of the run procedure.
+- The failure from the first grant session is now a process lesson:
+  - one run produced a strong but over-cap H100 result
+  - a second run was promising but got cut off
+  - because the pod died before a local pullback, the final artifact and full second-run log were lost
+  - that cannot happen again
 
 ## Next experiments
 
@@ -507,7 +569,8 @@ Use this when ranking experiments on a more faithful local objective:
   - parked after `15x528`, `16x512`, and `15x540` all lost to `14x560`
   - revisit only if a different head geometry or export path makes deeper shapes more attractive
 - H100 rerun target:
-  - highest-priority remote rerun is the lost `SP1024 9x512 + compression/grid` run
+  - highest-priority remote follow-up is now the legal `SP1024 9x512 + targeted residual` branch
+  - use the plain `SP1024 9x512` run as the remote control
   - do not spend new H100 credits on the over-cap `14x576` branch unless the export path changes drastically
 - Export-side symmetry-aware permutation:
   - initial MLP-only pass gave a tiny size win but slightly worse BPB
